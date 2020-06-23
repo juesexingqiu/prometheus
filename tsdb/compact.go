@@ -575,7 +575,7 @@ func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockRe
 	closers = append(closers, indexw)
 
 	if err := c.populateBlock(blocks, meta, indexw, chunkw); err != nil {
-		return errors.Wrap(err, "write compaction")
+		return errors.Wrap(err, "populate block")
 	}
 
 	select {
@@ -648,9 +648,9 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	}
 
 	var (
-		set         storage.DeprecatedChunkSeriesSet
+		sets        []storage.ChunkSeriesSet
 		symbols     index.StringIter
-		closers     = []io.Closer{}
+		closers     []io.Closer
 		overlapping bool
 	)
 	defer func() {
@@ -705,18 +705,11 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			return err
 		}
 		all = indexr.SortedPostings(all)
-
-		s := newCompactionSeriesSet(indexr, chunkr, tombsr, all)
+		sets = append(sets, newBlockChunkSeriesSet(indexr, chunkr, tombsr, all, meta.MinTime, meta.MaxTime))
 		syms := indexr.Symbols()
-
 		if i == 0 {
-			set = s
 			symbols = syms
 			continue
-		}
-		set, err = newCompactionMerger(set, s)
-		if err != nil {
-			return err
 		}
 		symbols = newMergedStringIter(symbols, syms)
 	}
@@ -730,8 +723,18 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		return errors.Wrap(symbols.Err(), "next symbol")
 	}
 
-	delIter := &deletedIterator{}
-	ref := uint64(0)
+	var (
+		ref  = uint64(0)
+		chks []chunks.Meta
+	)
+
+	set := sets[0]
+	if len(sets) > 1 {
+		// Merge series using compacting chunk series merger.
+		set = storage.NewMergeChunkSeriesSet(sets, storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	}
+
+	// Iterate over all sorted chunk series.
 	for set.Next() {
 		select {
 		case <-c.ctx.Done():
@@ -739,12 +742,14 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		default:
 		}
 
-		lset, chks, dranges := set.At() // The chunks here are not fully deleted.
-		if overlapping {
-			// If blocks are overlapping, it is possible to have unsorted chunks.
-			sort.Slice(chks, func(i, j int) bool {
-				return chks[i].MinTime < chks[j].MinTime
-			})
+		chksIter := set.At().Iterator()
+		chks = chks[:0]
+		for chksIter.Next() {
+			// TODO(bwplotk): We now iterate over chunks, consider using this fact to stream writes more.
+			chks = append(chks, chksIter.At())
+		}
+		if chksIter.Err() != nil {
+			return errors.Wrap(chksIter.Err(), "chunk iter")
 		}
 
 		// Skip the series with all deleted chunks.
@@ -752,85 +757,24 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			continue
 		}
 
-		for i, chk := range chks {
-			// Re-encode head chunks that are still open (being appended to) or
-			// outside the compacted MaxTime range.
-			// The chunk.Bytes() method is not safe for open chunks hence the re-encoding.
-			// This happens when snapshotting the head block.
-			//
-			// Block time range is half-open: [meta.MinTime, meta.MaxTime) and
-			// chunks are closed hence the chk.MaxTime >= meta.MaxTime check.
-			//
-			// TODO think how to avoid the typecasting to verify when it is head block.
-			if _, isHeadChunk := chk.Chunk.(*safeChunk); isHeadChunk && chk.MaxTime >= meta.MaxTime {
-				dranges = append(dranges, tombstones.Interval{Mint: meta.MaxTime, Maxt: math.MaxInt64})
-
-			} else
-			// Sanity check for disk blocks.
-			// chk.MaxTime == meta.MaxTime shouldn't happen as well, but will brake many users so not checking for that.
-			if chk.MinTime < meta.MinTime || chk.MaxTime > meta.MaxTime {
-				return errors.Errorf("found chunk with minTime: %d maxTime: %d outside of compacted minTime: %d maxTime: %d",
-					chk.MinTime, chk.MaxTime, meta.MinTime, meta.MaxTime)
-			}
-
-			if len(dranges) > 0 {
-				// Re-encode the chunk to not have deleted values.
-				if !chk.OverlapsClosedInterval(dranges[0].Mint, dranges[len(dranges)-1].Maxt) {
-					continue
-				}
-				newChunk := chunkenc.NewXORChunk()
-				app, err := newChunk.Appender()
-				if err != nil {
-					return err
-				}
-
-				delIter.it = chk.Chunk.Iterator(delIter.it)
-				delIter.intervals = dranges
-
-				var (
-					t int64
-					v float64
-				)
-				for delIter.Next() {
-					t, v = delIter.At()
-					app.Append(t, v)
-				}
-				if err := delIter.Err(); err != nil {
-					return errors.Wrap(err, "iterate chunk while re-encoding")
-				}
-
-				chks[i].Chunk = newChunk
-				chks[i].MaxTime = t
-			}
-		}
-
-		mergedChks := chks
-		if overlapping {
-			mergedChks, err = chunks.MergeOverlappingChunks(chks)
-			if err != nil {
-				return errors.Wrap(err, "merge overlapping chunks")
-			}
-		}
-		if err := chunkw.WriteChunks(mergedChks...); err != nil {
+		if err := chunkw.WriteChunks(chks...); err != nil {
 			return errors.Wrap(err, "write chunks")
 		}
-
-		if err := indexw.AddSeries(ref, lset, mergedChks...); err != nil {
+		if err := indexw.AddSeries(ref, set.At().Labels(), chks...); err != nil {
 			return errors.Wrap(err, "add series")
 		}
 
-		meta.Stats.NumChunks += uint64(len(mergedChks))
+		meta.Stats.NumChunks += uint64(len(chks))
 		meta.Stats.NumSeries++
-		for _, chk := range mergedChks {
+		for _, chk := range chks {
 			meta.Stats.NumSamples += uint64(chk.Chunk.NumSamples())
 		}
 
-		for _, chk := range mergedChks {
+		for _, chk := range chks {
 			if err := c.chunkPool.Put(chk.Chunk); err != nil {
 				return errors.Wrap(err, "put chunk")
 			}
 		}
-
 		ref++
 	}
 	if set.Err() != nil {
@@ -840,166 +784,317 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	return nil
 }
 
-type compactionSeriesSet struct {
+// blockBaseSeriesSet allows to iterate over all series in the single block.
+// Iterated series are trimmed with given min and max time as well as tombstones.
+// See newBlockSeriesSet and newBlockChunkSeriesSet to use it for either sample or chunk iterating.
+type blockBaseSeriesSet struct {
 	p          index.Postings
 	index      IndexReader
 	chunks     ChunkReader
 	tombstones tombstones.Reader
+	mint, maxt int64
 
-	l         labels.Labels
-	c         []chunks.Meta
+	currIter   *populateWithTombBaseSeriesIterator
+	currLabels labels.Labels
+
 	intervals tombstones.Intervals
 	err       error
 }
 
-func newCompactionSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings) *compactionSeriesSet {
-	return &compactionSeriesSet{
-		index:      i,
-		chunks:     c,
-		tombstones: t,
-		p:          p,
-	}
-}
+func (b *blockBaseSeriesSet) Next() bool {
+	var (
+		lbls labels.Labels
+		chks []chunks.Meta
+	)
 
-func (c *compactionSeriesSet) Next() bool {
-	if !c.p.Next() {
-		return false
-	}
-	var err error
-
-	c.intervals, err = c.tombstones.Get(c.p.At())
-	if err != nil {
-		c.err = errors.Wrap(err, "get tombstones")
-		return false
-	}
-
-	if err = c.index.Series(c.p.At(), &c.l, &c.c); err != nil {
-		c.err = errors.Wrapf(err, "get series %d", c.p.At())
-		return false
-	}
-
-	// Remove completely deleted chunks.
-	if len(c.intervals) > 0 {
-		chks := make([]chunks.Meta, 0, len(c.c))
-		for _, chk := range c.c {
-			if !(tombstones.Interval{Mint: chk.MinTime, Maxt: chk.MaxTime}.IsSubrange(c.intervals)) {
-				chks = append(chks, chk)
+	for b.p.Next() {
+		if err := b.index.Series(b.p.At(), &lbls, &chks); err != nil {
+			// Postings may be stale. Skip if no underlying series exists.
+			if errors.Cause(err) == storage.ErrNotFound {
+				continue
 			}
-		}
-
-		c.c = chks
-	}
-
-	for i := range c.c {
-		chk := &c.c[i]
-
-		chk.Chunk, err = c.chunks.Chunk(chk.Ref)
-		if err != nil {
-			c.err = errors.Wrapf(err, "chunk %d not found", chk.Ref)
+			b.err = errors.Wrapf(err, "get series %d", b.p.At())
 			return false
 		}
-	}
 
-	return true
-}
-
-func (c *compactionSeriesSet) Err() error {
-	if c.err != nil {
-		return c.err
-	}
-	return c.p.Err()
-}
-
-func (c *compactionSeriesSet) At() (labels.Labels, []chunks.Meta, tombstones.Intervals) {
-	return c.l, c.c, c.intervals
-}
-
-type compactionMerger struct {
-	a, b storage.DeprecatedChunkSeriesSet
-
-	aok, bok  bool
-	l         labels.Labels
-	c         []chunks.Meta
-	intervals tombstones.Intervals
-}
-
-// TODO(bwplotka): Move to storage mergers.
-func newCompactionMerger(a, b storage.DeprecatedChunkSeriesSet) (*compactionMerger, error) {
-	c := &compactionMerger{
-		a: a,
-		b: b,
-	}
-	// Initialize first elements of both sets as Next() needs
-	// one element look-ahead.
-	c.aok = c.a.Next()
-	c.bok = c.b.Next()
-
-	return c, c.Err()
-}
-
-func (c *compactionMerger) compare() int {
-	if !c.aok {
-		return 1
-	}
-	if !c.bok {
-		return -1
-	}
-	a, _, _ := c.a.At()
-	b, _, _ := c.b.At()
-	return labels.Compare(a, b)
-}
-
-func (c *compactionMerger) Next() bool {
-	if !c.aok && !c.bok || c.Err() != nil {
-		return false
-	}
-	// While advancing child iterators the memory used for labels and chunks
-	// may be reused. When picking a series we have to store the result.
-	var lset labels.Labels
-	var chks []chunks.Meta
-
-	d := c.compare()
-	if d > 0 {
-		lset, chks, c.intervals = c.b.At()
-		c.l = append(c.l[:0], lset...)
-		c.c = append(c.c[:0], chks...)
-
-		c.bok = c.b.Next()
-	} else if d < 0 {
-		lset, chks, c.intervals = c.a.At()
-		c.l = append(c.l[:0], lset...)
-		c.c = append(c.c[:0], chks...)
-
-		c.aok = c.a.Next()
-	} else {
-		// Both sets contain the current series. Chain them into a single one.
-		l, ca, ra := c.a.At()
-		_, cb, rb := c.b.At()
-
-		for _, r := range rb {
-			ra = ra.Add(r)
+		b.intervals, b.err = b.tombstones.Get(b.p.At())
+		if b.err != nil {
+			b.err = errors.Wrap(b.err, "get tombstones")
+			return false
 		}
 
-		c.l = append(c.l[:0], l...)
-		c.c = append(append(c.c[:0], ca...), cb...)
-		c.intervals = ra
+		b.currLabels = lbls
+		b.currIter = newPopulateWithTombBaseSeries(b.chunks, chks, b.intervals, b.mint, b.maxt)
+		if b.currIter.next() {
+			return true
+		}
+	}
+	return false
+}
 
-		c.aok = c.a.Next()
-		c.bok = c.b.Next()
+func (b *blockBaseSeriesSet) Err() error {
+	if b.err != nil {
+		return b.err
+	}
+	return b.p.Err()
+}
+
+func (b *blockBaseSeriesSet) Warnings() storage.Warnings { return nil }
+
+// populateWithTombBaseSeriesIterator allows to iterate over given chunk metas. In each iteration it ensures
+// that chunks are trimmed based on min, max time and tombstones.
+type populateWithTombBaseSeriesIterator struct {
+	chunks ChunkReader
+
+	// Requested min and max time range to trim chunks for.
+	mint, maxt int64
+	// chks are expected to be sorted by minTime and should be related to the same, single series.
+	chks      []chunks.Meta
+	intervals tombstones.Intervals
+
+	i   int
+	err error
+
+	bufIter *deletedIterator
+
+	nextDelIter chunkenc.Iterator
+	nextChkMeta chunks.Meta
+}
+
+func newPopulateWithTombBaseSeries(
+	chunks ChunkReader,
+	chks []chunks.Meta,
+	intervals tombstones.Intervals,
+	mint, maxt int64,
+) *populateWithTombBaseSeriesIterator {
+	return &populateWithTombBaseSeriesIterator{
+		chunks:    chunks,
+		mint:      mint,
+		maxt:      maxt,
+		chks:      chks,
+		intervals: intervals,
+		i:         -1,
+		bufIter:   &deletedIterator{},
+	}
+}
+
+func (p *populateWithTombBaseSeriesIterator) next() bool {
+	for p.err == nil && p.i < len(p.chks)-1 {
+		p.i++
+		p.nextChkMeta = p.chks[p.i]
+
+		// NOTE:
+		// * block time range is half-open: [meta.MinTime, meta.MaxTime).
+		// * chunks are both closed: [chk.MinTime, chk.MaxTime].
+		// * requested time ranges are closed: [req.Start, req.End].
+
+		if p.nextChkMeta.MaxTime < p.mint {
+			// Fully before the requested range.
+			continue
+		}
+
+		if p.nextChkMeta.MinTime > p.maxt {
+			// Fully outside of the requested range.
+			p.i = len(p.chks)
+			return false
+		}
+
+		// We cannot use p.intervals directly, as we don't want to modify it for next iterations.
+		p.bufIter.intervals = append(p.bufIter.intervals[:0], p.intervals...)
+
+		// Re-encode head chunks that are partially outside of requested min and max time.
+		if p.nextChkMeta.MaxTime > p.maxt {
+			p.bufIter.intervals = append(p.bufIter.intervals, tombstones.Interval{Mint: p.maxt + 1, Maxt: math.MaxInt64})
+		}
+		if p.nextChkMeta.MinTime < p.mint {
+			p.bufIter.intervals = append(p.bufIter.intervals, tombstones.Interval{Mint: math.MinInt64, Maxt: p.mint - 1})
+		}
+
+		p.nextChkMeta.Chunk, p.err = p.chunks.Chunk(p.nextChkMeta.Ref)
+		if p.err != nil {
+			p.err = errors.Wrapf(p.err, "cannot populate chunk %d", p.nextChkMeta.Ref)
+			return false
+		}
+
+		if len(p.bufIter.intervals) <= len(p.intervals) &&
+			(len(p.intervals) == 0 || !p.nextChkMeta.OverlapsClosedInterval(
+				p.bufIter.intervals[0].Mint,
+				p.bufIter.intervals[len(p.bufIter.intervals)-1].Maxt,
+			)) {
+			// Nothing to rewrite take chunk as it is.
+			p.nextDelIter = nil
+			return true
+		}
+		// We don't want full chunk, just part of it.
+		p.bufIter.it = p.nextChkMeta.Chunk.Iterator(p.bufIter.it)
+		p.nextDelIter = p.bufIter
+		return true
+	}
+	return false
+}
+
+func (p *populateWithTombBaseSeriesIterator) Err() error { return p.err }
+
+func (p *populateWithTombBaseSeriesIterator) toSeriesIterator(isNext bool) chunkenc.Iterator {
+	return &populateWithTombSeriesIterator{populateWithTombBaseSeriesIterator: p, isNext: isNext}
+}
+func (p *populateWithTombBaseSeriesIterator) toChunkSeriesIterator(isNext bool) chunks.Iterator {
+	return &populateWithTombChunkSeriesIterator{populateWithTombBaseSeriesIterator: p, isNext: isNext}
+}
+
+// populateWithTombSeriesIterator allows to iterate over samples for the single series.
+type populateWithTombSeriesIterator struct {
+	*populateWithTombBaseSeriesIterator
+
+	curr   chunkenc.Iterator
+	isNext bool
+}
+
+func (p *populateWithTombSeriesIterator) Next() bool {
+	if p.curr != nil && p.curr.Next() {
+		return true
 	}
 
+	for p.isNext {
+		if p.nextDelIter != nil {
+			p.curr = p.nextDelIter
+		} else {
+			p.curr = p.nextChkMeta.Chunk.Iterator(p.bufIter)
+		}
+		p.isNext = p.next()
+
+		if p.curr.Next() {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *populateWithTombSeriesIterator) Seek(t int64) bool {
+	if p.curr != nil && p.curr.Seek(t) {
+		return true
+	}
+	for p.Next() {
+		if p.curr.Seek(t) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *populateWithTombSeriesIterator) At() (int64, float64) { return p.curr.At() }
+
+func (p *populateWithTombSeriesIterator) Err() error {
+	if err := p.populateWithTombBaseSeriesIterator.Err(); err != nil {
+		return err
+	}
+	if p.curr != nil {
+		return p.curr.Err()
+	}
+	return nil
+}
+
+type populateWithTombChunkSeriesIterator struct {
+	*populateWithTombBaseSeriesIterator
+
+	curr   chunks.Meta
+	isNext bool
+}
+
+func (p *populateWithTombChunkSeriesIterator) Next() bool {
+	if !p.isNext {
+		return false
+	}
+
+	p.curr = p.nextChkMeta
+	defer func() { p.isNext = p.next() }()
+
+	if p.nextDelIter == nil {
+		return true
+	}
+
+	// Re-encode the chunk to not have deleted values or if they are still open from case above.
+	newChunk := chunkenc.NewXORChunk()
+	app, err := newChunk.Appender()
+	if err != nil {
+		p.err = err
+		return false
+	}
+
+	var (
+		t int64
+		v float64
+	)
+	for p.nextDelIter.Next() {
+		t, v = p.nextDelIter.At()
+		app.Append(t, v)
+	}
+	if err := p.nextDelIter.Err(); err != nil {
+		p.err = errors.Wrap(err, "iterate chunk while re-encoding")
+		return false
+	}
+
+	p.curr.Chunk = newChunk
+	p.curr.MaxTime = t
 	return true
 }
 
-func (c *compactionMerger) Err() error {
-	if c.a.Err() != nil {
-		return c.a.Err()
-	}
-	return c.b.Err()
+func (p *populateWithTombChunkSeriesIterator) At() chunks.Meta { return p.curr }
+
+// blockSeriesSet allows to iterate over sorted, populated series with applied tombstones.
+// Series with all deleted chunks are still present as Series with no samples.
+// Samples from chunks are also trimmed to requested min and max time.
+type blockSeriesSet struct {
+	blockBaseSeriesSet
 }
 
-func (c *compactionMerger) At() (labels.Labels, []chunks.Meta, tombstones.Intervals) {
-	return c.l, c.c, c.intervals
+func newBlockSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings, mint, maxt int64) storage.SeriesSet {
+	return &blockSeriesSet{
+		blockBaseSeriesSet{
+			index:      i,
+			chunks:     c,
+			tombstones: t,
+			p:          p,
+			mint:       mint,
+			maxt:       maxt,
+		},
+	}
+}
+
+func (b *blockSeriesSet) At() storage.Series {
+	return &storage.SeriesEntry{
+		Lset: b.currLabels,
+		// blockBaseSeriesSet only returns Next true, if curr iter has some iteration ready.
+		SampleIteratorFn: func() chunkenc.Iterator { return b.currIter.toSeriesIterator(true) },
+	}
+}
+
+// blockChunkSeriesSet allows to iterate over sorted, populated series with applied tombstones.
+// Series with all deleted chunks are still present as Labelled iterator with no chunks.
+// Chunks are also trimmed to requested min and max time.
+type blockChunkSeriesSet struct {
+	blockBaseSeriesSet
+}
+
+func newBlockChunkSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings, mint, maxt int64) storage.ChunkSeriesSet {
+	return &blockChunkSeriesSet{
+		blockBaseSeriesSet{
+			index:      i,
+			chunks:     c,
+			tombstones: t,
+			p:          p,
+			mint:       mint,
+			maxt:       maxt,
+		},
+	}
+}
+
+func (b *blockChunkSeriesSet) At() storage.ChunkSeries {
+	return &storage.ChunkSeriesEntry{
+		Lset: b.currLabels,
+		// blockBaseSeriesSet only returns Next true, if curr iter has some iteration ready.
+		ChunkIteratorFn: func() chunks.Iterator { return b.currIter.toChunkSeriesIterator(true) },
+	}
 }
 
 func newMergedStringIter(a index.StringIter, b index.StringIter) index.StringIter {
