@@ -150,6 +150,7 @@ func InstrumentRoundTripperTrace(it *InstrumentTrace, next http.RoundTripper) Ro
 					it.PutIdleConn(time.Since(start).Seconds())
 				}
 			},
+			// 函数体不需要参数，但为了符合函数签名，声明参数类型，使用下划线忽略参数
 			DNSStart: func(_ httptrace.DNSStartInfo) {
 				if it.DNSStart != nil {
 					it.DNSStart(time.Since(start).Seconds())

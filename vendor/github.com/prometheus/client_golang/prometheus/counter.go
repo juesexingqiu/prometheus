@@ -88,6 +88,8 @@ type counter struct {
 	// valInt stores values that are exact integers. Both have to go first
 	// in the struct to guarantee alignment for atomic operations.
 	// http://golang.org/pkg/sync/atomic/#pkg-note-BUG
+	// 需要使用原子操作，但是原子操作只能针对整数操作，无法对浮点型原子操作，所以拆开
+	// val代表整数和，valbits代表浮点数的和
 	valBits uint64
 	valInt  uint64
 
@@ -110,12 +112,14 @@ func (c *counter) Add(v float64) {
 	}
 
 	ival := uint64(v)
+	// 如果可以直接转化为整数，并且不损失数值，则代表为整数，直接相加即可
 	if float64(ival) == v {
 		atomic.AddUint64(&c.valInt, ival)
 		return
 	}
 
 	for {
+		// 如果v是浮点数，则使用二进制浮点数存储最后的结果，这就可以使用原子操作了
 		oldBits := atomic.LoadUint64(&c.valBits)
 		newBits := math.Float64bits(math.Float64frombits(oldBits) + v)
 		if atomic.CompareAndSwapUint64(&c.valBits, oldBits, newBits) {

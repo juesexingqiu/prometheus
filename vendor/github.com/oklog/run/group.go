@@ -12,6 +12,7 @@ type Group struct {
 	actors []actor
 }
 
+// 1. 使用函数类型作为函数参数
 // Add an actor (function) to the group. Each actor must be pre-emptable by an
 // interrupt function. That is, if interrupt is invoked, execute should return.
 // Also, it must be safe to call interrupt even after execute has returned.

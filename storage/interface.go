@@ -117,6 +117,8 @@ type SelectHints struct {
 	Range    int64    // Range vector selector range in milliseconds.
 }
 
+// 1. 函数也是一种类型，也可以被定义
+// 2. 为函数定义类型，使函数满足某个接口
 // TODO(bwplotka): Move to promql/engine_test.go?
 // QueryableFunc is an adapter to allow the use of ordinary functions as
 // Queryables. It follows the idea of http.HandlerFunc.

@@ -207,6 +207,7 @@ func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
 	if opts.Timeout <= 0 {
 		return h
 	}
+	// 获取带有超时逻辑的handler
 	return http.TimeoutHandler(h, opts.Timeout, fmt.Sprintf(
 		"Exceeded configured timeout of %v.\n",
 		opts.Timeout,

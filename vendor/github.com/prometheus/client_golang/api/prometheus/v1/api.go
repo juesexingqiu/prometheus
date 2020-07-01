@@ -139,6 +139,7 @@ const (
 	epFlags           = apiPrefix + "/status/flags"
 )
 
+// 定义类型，提高可读性
 // AlertState models the state of an alert.
 type AlertState string
 
@@ -386,6 +387,7 @@ type queryResult struct {
 }
 
 func (rg *RuleGroup) UnmarshalJSON(b []byte) error {
+	// 匿名结构体
 	v := struct {
 		Name     string            `json:"name"`
 		File     string            `json:"file"`

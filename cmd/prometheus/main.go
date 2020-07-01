@@ -492,7 +492,7 @@ func main() {
 	// Start all components while we wait for TSDB to open but only load
 	// initial config and mark ourselves as ready after it completed.
 	dbOpen := make(chan struct{})
-
+	// 1. 函数类型也是一种类型，结构体字段也可以是函数类型
 	// sync.Once is used to make sure we can close the channel at different execution stages(SIGTERM or when the config is loaded).
 	type closeOnce struct {
 		C     chan struct{}
@@ -503,6 +503,7 @@ func main() {
 	reloadReady := &closeOnce{
 		C: make(chan struct{}),
 	}
+	// 1. 匿名函数
 	reloadReady.Close = func() {
 		reloadReady.once.Do(func() {
 			close(reloadReady.C)
@@ -885,6 +886,7 @@ type sender interface {
 	Send(alerts ...*notifier.Alert)
 }
 
+// 1. 通过闭包将参数注入嵌套函数，从而创造符合特定签名的函数
 // sendAlerts implements the rules.NotifyFunc for a Notifier.
 func sendAlerts(s sender, externalURL string) rules.NotifyFunc {
 	return func(ctx context.Context, expr string, alerts ...*rules.Alert) {

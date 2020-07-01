@@ -25,6 +25,7 @@ import (
 	"time"
 )
 
+// 设置连接参数
 // DefaultRoundTripper is used if no RoundTripper is set in Config.
 var DefaultRoundTripper http.RoundTripper = &http.Transport{
 	Proxy: http.ProxyFromEnvironment,
