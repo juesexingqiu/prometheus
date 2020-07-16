@@ -432,7 +432,7 @@ func main() {
 	http.DefaultTransport.(*http.Transport).DialContext = conntrack.NewDialContextFunc(
 		conntrack.DialWithTracing(),
 	)
-
+	// 当需要执行一组行为时，可以构造函数数组
 	reloaders := []func(cfg *config.Config) error{
 		remoteStorage.ApplyConfig,
 		webHandler.ApplyConfig,
@@ -499,6 +499,7 @@ func main() {
 		once  sync.Once
 		Close func()
 	}
+	// 理论上，大部分情况下不需要使用函数作为结构体的字段，使用函数作为结构体的方法即可。但如果方法的定义是变化的，则需要使用函数作为结构体的字段。
 	// Wait until the server is ready to handle reloading.
 	reloadReady := &closeOnce{
 		C: make(chan struct{}),

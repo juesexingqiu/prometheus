@@ -480,6 +480,7 @@ func (r *AlertingRule) ForEachActiveAlert(f func(*Alert)) {
 	}
 }
 
+// 使用函数作为函数的参数，说明行为是可变的，不同的行为又存在相似性，比如依赖的参数相同，此时可以使用函数类型作为另一个函数的参数
 func (r *AlertingRule) sendAlerts(ctx context.Context, ts time.Time, resendDelay time.Duration, interval time.Duration, notifyFunc NotifyFunc) {
 	alerts := []*Alert{}
 	r.ForEachActiveAlert(func(alert *Alert) {
